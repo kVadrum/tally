@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+# tally - token and activity report for Claude Code session transcripts.
+#
+# Reads Claude Code session transcript .jsonl files and reports, per session:
+# wall-clock duration, prompt/turn/tool-call counts, and token usage broken
+# into input / output / cache-read / cache-write buckets.
+#
+# The load-bearing detail: token usage is DEDUPED by assistant message id.
+# Claude Code logs an assistant response once per content block, every copy
+# carrying the same usage object. Summing the raw lines overcounts (often
+# 2-3x). tally groups by .message.id and counts each response once.
+#
+# Bash + jq, zero other deps. Host-agnostic: operates on a file or directory
+# you point it at; defaults to the current directory.
+
+set -euo pipefail
+
+VERSION="0.1.2"
+PROG="tally"
+
+# ---- output helpers -------------------------------------------------------
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_DIM=$'\033[2m'; C_B=$'\033[1m'; C_RST=$'\033[0m'
+else
+  C_DIM=""; C_B=""; C_RST=""
+fi
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 2; }
+
+usage() {
+  cat <<EOF
+$PROG $VERSION - token and activity report for Claude Code session transcripts
+
+USAGE
+  $PROG [OPTIONS] [PATH]
+
+  PATH is a transcript .jsonl file, or a directory of them. Defaults to the
+  current directory. Claude Code keeps transcripts under
+  ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
+
+OPTIONS
+  --json        Machine-readable JSON (one object per session + a total).
+  --quiet, -q   Directory mode: print only the TOTAL line.
+  --no-color    Disable ANSI styling (also honors NO_COLOR).
+  --version     Print version and exit.
+  -h, --help    This help.
+
+OUTPUT
+  Token counts are deduped by assistant message id, so they match what the
+  API actually billed rather than the raw line count. Tokens are bucketed
+  into input, output, cache-read, and cache-write.
+
+EXIT
+  0  ok
+  2  usage error, bad path, or no transcripts found
+EOF
+}
+
+# ---- jq: summarize one transcript file into a compact JSON object ----------
+# Emits {} (empty object) for a file with no recognizable events, so callers
+# can detect and skip it. Errors (invalid JSON) surface as a non-zero jq exit.
+read -r -d '' JQ_SUMMARY <<'JQ' || true
+def epoch: sub("\\.[0-9]+Z$";"Z") | fromdateiso8601;
+def ts_clean: sub("\\.[0-9]+Z$";"Z");
+
+# . is the array of all line objects (jq -s).
+(map(select(.type=="assistant"))) as $a
+# id is the dedup key (one response repeated per content block); uuid and
+# timestamp are fallbacks so an id-less line stays its own turn rather than
+# collapsing every id-less line into one.
+| ($a | group_by(.message.id // .uuid // .timestamp) | map(.[0])) as $turns
+| ([.[] | .timestamp // empty]) as $stamps
+| (if ($a|length)==0 and ($stamps|length)==0 then {} else
+  {
+    session:  ([.[] | .sessionId // empty] | last),
+    cwd:      ([.[] | .cwd // empty]       | last),
+    branch:   ([.[] | .gitBranch // empty] | last),
+    version:  ([.[] | .version // empty]   | last),
+    models:   ([$a[] | .message.model // empty] | unique),
+    started:  ($stamps | min),
+    ended:    ($stamps | max),
+    prompts:  ([.[] | select(.type=="user" and (.message.content|type=="string"))] | length),
+    turns:    ($turns | length),
+    input:       ([$turns[] | .message.usage.input_tokens // 0]                 | add // 0),
+    output:      ([$turns[] | .message.usage.output_tokens // 0]                | add // 0),
+    cache_read:  ([$turns[] | .message.usage.cache_read_input_tokens // 0]      | add // 0),
+    cache_write: ([$turns[] | .message.usage.cache_creation_input_tokens // 0]  | add // 0),
+    tool_counts: ([$a[] | .message.content[]? | select(.type=="tool_use") | .name]
+                  | group_by(.) | map({name: .[0], n: length}) | sort_by(-.n))
+  }
+  | .ntools = ([.tool_counts[].n] | add // 0)
+  | .elapsed_s = (if .started and .ended then ((.ended|epoch) - (.started|epoch)) else 0 end)
+  | .started = (.started // null | if . then ts_clean else null end)
+  | .ended   = (.ended   // null | if . then ts_clean else null end)
+  end)
+JQ
+
+summarize_file() {
+  # $1 = path; prints a JSON object (possibly {}). Non-zero exit on bad JSON.
+  jq -s "$JQ_SUMMARY" "$1"
+}
+
+# ---- formatting -----------------------------------------------------------
+
+commafy() { # group an integer with thousands separators
+  printf '%s' "$1" | sed -e ':a' -e 's/\B[0-9]\{3\}\>/,&/;ta'
+}
+
+fmt_elapsed() { # seconds -> "1h 02m 03s" / "4m 05s" / "12s"
+  local s=$1 h m
+  if [ "$s" -lt 0 ] 2>/dev/null; then s=0; fi
+  h=$(( s / 3600 )); m=$(( (s % 3600) / 60 )); s=$(( s % 60 ))
+  if [ "$h" -gt 0 ]; then printf '%dh %02dm %02ds' "$h" "$m" "$s"
+  elif [ "$m" -gt 0 ]; then printf '%dm %02ds' "$m" "$s"
+  else printf '%ds' "$s"; fi
+}
+
+short_id() { printf '%s' "${1:0:8}"; }      # first 8 chars of a session id
+short_model() { printf '%s' "${1#claude-}"; } # strip the claude- prefix
+
+# Strip control characters from every string field of a session object on
+# stdin. A crafted transcript can put an ESC into cwd/branch/model/version;
+# jq -r would decode it to a raw byte that spoofs the terminal. Used at the
+# text-render boundary only -- --json stays exact (jq re-escapes there).
+sanitize_obj() { jq -c 'walk(if type=="string" then gsub("[[:cntrl:]]";"") else . end)'; }
+
+# Detailed single-session text block from one JSON object on stdin.
+render_detail() {
+  local obj; obj=$(sanitize_obj)
+  local sid cwd br ver models started elapsed prompts turns ntools
+  local input output cread cwrite tools
+  sid=$(jq -r '.session // "?"' <<<"$obj")
+  cwd=$(jq -r '.cwd // "?"' <<<"$obj")
+  br=$(jq -r '.branch // "?"' <<<"$obj")
+  ver=$(jq -r '.version // "?"' <<<"$obj")
+  models=$(jq -r '(.models // []) | map(sub("^claude-";"")) | join(", ")' <<<"$obj")
+  started=$(jq -r '.started // "?"' <<<"$obj")
+  elapsed=$(fmt_elapsed "$(jq -r '.elapsed_s // 0' <<<"$obj")")
+  prompts=$(jq -r '.prompts // 0' <<<"$obj")
+  turns=$(jq -r '.turns // 0' <<<"$obj")
+  ntools=$(jq -r '.ntools // 0' <<<"$obj")
+  input=$(commafy "$(jq -r '.input // 0' <<<"$obj")")
+  output=$(commafy "$(jq -r '.output // 0' <<<"$obj")")
+  cread=$(commafy "$(jq -r '.cache_read // 0' <<<"$obj")")
+  cwrite=$(commafy "$(jq -r '.cache_write // 0' <<<"$obj")")
+  tools=$(jq -r '(.tool_counts // []) | map("\(.name) \(.n)") | join("  ")' <<<"$obj")
+  [ -n "$tools" ] || tools="(none)"
+
+  printf '%ssession%s  %s%s%s  %s(%s, %s)%s\n' \
+    "$C_DIM" "$C_RST" "$C_B" "$(short_id "$sid")" "$C_RST" \
+    "$C_DIM" "$(basename "$cwd")" "$br" "$C_RST"
+  printf '%smodel  %s  %s\n' "$C_DIM" "$C_RST" "${models:-?}"
+  printf '%sstart  %s  %s\n' "$C_DIM" "$C_RST" "$started"
+  printf '%selapsd %s  %s\n' "$C_DIM" "$C_RST" "$elapsed"
+  printf '%sprompt %s  %s\n' "$C_DIM" "$C_RST" "$prompts"
+  printf '%sturns  %s  %s assistant responses\n' "$C_DIM" "$C_RST" "$turns"
+  printf '%stools  %s  %s calls   %s%s%s\n' "$C_DIM" "$C_RST" "$ntools" "$C_DIM" "$tools" "$C_RST"
+  printf '%stokens %s  in %s   out %s%s%s   cache-read %s   cache-write %s\n' \
+    "$C_DIM" "$C_RST" "$input" "$C_B" "$output" "$C_RST" "$cread" "$cwrite"
+  printf '%sclient %s  %s\n' "$C_DIM" "$C_RST" "$ver"
+}
+
+# One-line table row from a JSON object on stdin.
+render_row() {
+  local obj; obj=$(sanitize_obj)
+  local date sid elapsed prompts turns ntools output model
+  date=$(jq -r '(.started // "")[0:10]' <<<"$obj"); [ -n "$date" ] || date="??????????"
+  sid=$(short_id "$(jq -r '.session // "?"' <<<"$obj")")
+  elapsed=$(fmt_elapsed "$(jq -r '.elapsed_s // 0' <<<"$obj")")
+  prompts=$(jq -r '.prompts // 0' <<<"$obj")
+  turns=$(jq -r '.turns // 0' <<<"$obj")
+  ntools=$(jq -r '.ntools // 0' <<<"$obj")
+  output=$(commafy "$(jq -r '.output // 0' <<<"$obj")")
+  model=$(jq -r '(.models // []) | map(sub("^claude-";"")) | (.[0] // "?")' <<<"$obj")
+  printf '%-10s  %-8s  %11s  %4s  %5s  %5s  %12s  %s\n' \
+    "$date" "$sid" "$elapsed" "$prompts" "$turns" "$ntools" "$output" "$model"
+}
+
+# ---- arg parse ------------------------------------------------------------
+
+WANT_JSON=0
+QUIET=0
+PATH_ARG=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json) WANT_JSON=1 ;;
+    -q|--quiet) QUIET=1 ;;
+    --no-color) C_DIM=""; C_B=""; C_RST="" ;;
+    --version) printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) die "unknown option: $1 (try --help)" ;;
+    *) [ -z "$PATH_ARG" ] || die "unexpected extra argument: $1"; PATH_ARG="$1" ;;
+  esac
+  shift
+done
+[ -n "$PATH_ARG" ] || PATH_ARG="${1:-.}"
+command -v jq >/dev/null 2>&1 || die "jq is required but not found on PATH"
+
+# ---- single file mode -----------------------------------------------------
+
+run_single() {
+  local file="$1" obj
+  [ -f "$file" ] || die "no such file: $file"
+  if ! obj=$(summarize_file "$file" 2>/dev/null); then
+    die "not a valid JSON transcript: $file"
+  fi
+  if [ "$obj" = "{}" ]; then
+    die "no session events found in: $file"
+  fi
+  if [ "$WANT_JSON" -eq 1 ]; then
+    printf '%s\n' "$obj" | jq .
+  else
+    printf '%s\n' "$obj" | render_detail
+  fi
+}
+
+# ---- directory mode -------------------------------------------------------
+
+run_dir() {
+  local dir="$1"
+  local -a files=()
+  while IFS= read -r f; do files+=("$f"); done < <(find "$dir" -maxdepth 1 -name '*.jsonl' -type f | sort)
+  [ "${#files[@]}" -gt 0 ] || die "no .jsonl transcripts in: $dir"
+
+  # Collect one summary object per file (skip empties / unparseable).
+  local -a objs=()
+  local f obj
+  for f in "${files[@]}"; do
+    if obj=$(summarize_file "$f" 2>/dev/null); then
+      if [ "$obj" != "{}" ]; then
+        objs+=("$obj")
+      else
+        printf '%s: skipping (no session events): %s\n' "$PROG" "$f" >&2
+      fi
+    else
+      printf '%s: skipping (invalid json): %s\n' "$PROG" "$f" >&2
+    fi
+  done
+  [ "${#objs[@]}" -gt 0 ] || die "no readable transcripts in: $dir"
+
+  # Sort by start time and build a JSON array.
+  local arr
+  arr=$(printf '%s\n' "${objs[@]}" | jq -s 'sort_by(.started // "")')
+
+  if [ "$WANT_JSON" -eq 1 ]; then
+    printf '%s' "$arr" | jq '{
+      sessions: .,
+      total: {
+        sessions:    length,
+        prompts:     (map(.prompts)     | add // 0),
+        turns:       (map(.turns)       | add // 0),
+        ntools:      (map(.ntools)      | add // 0),
+        input:       (map(.input)       | add // 0),
+        output:      (map(.output)      | add // 0),
+        cache_read:  (map(.cache_read)  | add // 0),
+        cache_write: (map(.cache_write) | add // 0),
+        elapsed_s:   (map(.elapsed_s)   | add // 0)
+      }
+    }'
+    return 0
+  fi
+
+  if [ "$QUIET" -eq 0 ]; then
+    printf '%s%-10s  %-8s  %11s  %4s  %5s  %5s  %12s  %s%s\n' \
+      "$C_DIM" "DATE" "SESSION" "ELAPSED" "PRMT" "TURNS" "TOOLS" "OUTPUT-TOK" "MODEL" "$C_RST"
+    printf '%s\n' "$arr" | jq -c '.[]' | while IFS= read -r obj; do
+      printf '%s' "$obj" | render_row
+    done
+  fi
+
+  # Totals.
+  local n tp tt tx to elapsed
+  n=$(printf '%s' "$arr" | jq 'length')
+  tp=$(printf '%s' "$arr" | jq 'map(.prompts) | add // 0')
+  tt=$(printf '%s' "$arr" | jq 'map(.turns) | add // 0')
+  tx=$(printf '%s' "$arr" | jq 'map(.ntools) | add // 0')
+  to=$(commafy "$(printf '%s' "$arr" | jq 'map(.output) | add // 0')")
+  elapsed=$(fmt_elapsed "$(printf '%s' "$arr" | jq 'map(.elapsed_s) | add // 0')")
+  printf '%sTOTAL%s  %s sessions  %s prompts  %s turns  %s tool calls  %s%s out-tok%s  %s\n' \
+    "$C_B" "$C_RST" "$n" "$tp" "$tt" "$tx" "$C_B" "$to" "$C_RST" "$elapsed"
+}
+
+# ---- dispatch -------------------------------------------------------------
+
+if [ -d "$PATH_ARG" ]; then
+  run_dir "$PATH_ARG"
+elif [ -f "$PATH_ARG" ]; then
+  run_single "$PATH_ARG"
+else
+  die "no such file or directory: $PATH_ARG"
+fi
